@@ -68,6 +68,12 @@ logs/
 # Temporary / Generated
 **/tmp/
 **/temp/
+out/
+**/out/
+
+# Local Maven install artifacts
+.tools/maven.zip
+.tools/apache-maven-*/
 
 # Git worktrees
 .worktrees/
@@ -78,4 +84,3 @@ content/docs/
 # Configuration files
 .claude/settings.local.json
 .claude/plans/
-
