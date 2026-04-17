@@ -43,13 +43,21 @@ import org.verapdf.parser.PDFFlavour;
 import org.verapdf.pd.PDDocument;
 import org.verapdf.tools.StaticResources;
 import org.verapdf.wcag.algorithms.entities.IObject;
+import org.verapdf.wcag.algorithms.entities.SemanticHeaderOrFooter;
 import org.verapdf.wcag.algorithms.entities.SemanticTextNode;
+import org.verapdf.wcag.algorithms.entities.content.ImageChunk;
 import org.verapdf.wcag.algorithms.entities.content.LineChunk;
+import org.verapdf.wcag.algorithms.entities.lists.ListItem;
+import org.verapdf.wcag.algorithms.entities.lists.PDFList;
 import org.verapdf.wcag.algorithms.entities.geometry.BoundingBox;
 import org.verapdf.wcag.algorithms.entities.tables.TableBordersCollection;
+import org.verapdf.wcag.algorithms.entities.tables.tableBorders.TableBorder;
+import org.verapdf.wcag.algorithms.entities.tables.tableBorders.TableBorderCell;
+import org.verapdf.wcag.algorithms.entities.tables.tableBorders.TableBorderRow;
 import org.verapdf.wcag.algorithms.semanticalgorithms.consumers.LinesPreprocessingConsumer;
 import org.verapdf.wcag.algorithms.semanticalgorithms.containers.StaticContainers;
 import org.verapdf.xmp.containers.StaticXmpCoreContainers;
+import org.opendataloader.pdf.entities.SemanticPicture;
 
 import java.io.File;
 import java.io.IOException;
@@ -381,17 +389,31 @@ public class DocumentProcessor {
             }
             StaticLayoutContainers.setImagesDirectory(imagesDirectory);
             Set<Integer> failedImagePages = writeImages(contents, inputPdfName, config);
-            if (!config.isHybridEnabled() && !failedImagePages.isEmpty()) {
-                Set<Integer> reroutedPages = rerouteFailedPagesToHybrid(inputPdfName, contents, config, failedImagePages);
-                if (!reroutedPages.isEmpty()) {
-                    // Re-render all images so indexes and output references stay consistent.
-                    StaticLayoutContainers.resetImageIndex();
-                    Set<Integer> stillFailedPages = writeImages(contents, inputPdfName, config);
-                    if (!stillFailedPages.isEmpty()) {
+            if (!failedImagePages.isEmpty()) {
+                // width/height <= 0 warning pages should not produce image output.
+                if (!config.isHybridEnabled()) {
+                    Set<Integer> reroutedPages = rerouteFailedPagesToHybrid(inputPdfName, contents, config, failedImagePages);
+                    if (reroutedPages.isEmpty()) {
                         LOGGER.log(Level.WARNING,
-                            "Image rendering warnings remain after hybrid fallback on pages {0}",
-                            toOneIndexedPageList(stillFailedPages));
+                            "Hybrid OCR fallback unavailable. Keeping text-only output on warning pages {0}",
+                            toOneIndexedPageList(failedImagePages));
+                    } else {
+                        LOGGER.log(Level.WARNING,
+                            "Hybrid OCR fallback applied on pages {0}. Image extraction disabled on those pages.",
+                            toOneIndexedPageList(reroutedPages));
                     }
+                }
+
+                dropImagesFromPages(contents, failedImagePages);
+
+                // Re-render all images after stripping image objects from warning pages.
+                StaticLayoutContainers.resetImageIndex();
+                clearImagesDirectory(imagesDirectory);
+                Set<Integer> stillFailedPages = writeImages(contents, inputPdfName, config);
+                if (!stillFailedPages.isEmpty()) {
+                    LOGGER.log(Level.WARNING,
+                        "Image rendering warnings remain after image-skip fallback on pages {0}",
+                        toOneIndexedPageList(stillFailedPages));
                 }
             }
         }
@@ -450,7 +472,9 @@ public class DocumentProcessor {
         try {
             config.setHybrid(Config.HYBRID_DOCLING_FAST);
             config.getHybridConfig().setMode(HybridConfig.MODE_FULL);
-            config.getHybridConfig().setFallbackToJava(true);
+            // For image-render warning fallback, enforce OCR-only replacement.
+            // If the hybrid backend is unavailable, caller keeps text-only output.
+            config.getHybridConfig().setFallbackToJava(false);
 
             List<List<IObject>> hybridContents = HybridDocumentProcessor.processDocument(
                 inputPdfName,
@@ -474,7 +498,7 @@ public class DocumentProcessor {
             return replacedPages;
         } catch (Exception e) {
             LOGGER.log(Level.WARNING,
-                "Hybrid fallback failed for pages {0}. Keeping Java output. Reason: {1}",
+                "Hybrid fallback failed for pages {0}. Keeping text-only output on those pages. Reason: {1}",
                 new Object[]{toOneIndexedPageList(validFailedPages), e.getMessage()});
             return Collections.emptySet();
         } finally {
@@ -489,6 +513,71 @@ public class DocumentProcessor {
             .map(page -> page + 1)
             .sorted()
             .collect(Collectors.toList());
+    }
+
+    private static void clearImagesDirectory(String imagesDirectory) {
+        if (imagesDirectory == null || imagesDirectory.isEmpty()) {
+            return;
+        }
+        File directory = new File(imagesDirectory);
+        if (!directory.exists() || !directory.isDirectory()) {
+            return;
+        }
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File file : files) {
+            if (file.isFile() && !file.delete()) {
+                LOGGER.log(Level.FINE, "Failed to delete stale image file: {0}", file.getAbsolutePath());
+            }
+        }
+    }
+
+    private static void dropImagesFromPages(List<List<IObject>> contents, Set<Integer> pages) {
+        if (pages == null || pages.isEmpty()) {
+            return;
+        }
+        for (Integer page : pages) {
+            if (page == null || page < 0 || page >= contents.size()) {
+                continue;
+            }
+            removeImagesRecursively(contents.get(page));
+        }
+    }
+
+    private static void removeImagesRecursively(List<IObject> objects) {
+        if (objects == null || objects.isEmpty()) {
+            return;
+        }
+        Iterator<IObject> iterator = objects.iterator();
+        while (iterator.hasNext()) {
+            IObject object = iterator.next();
+            if (object == null) {
+                continue;
+            }
+            if (object instanceof ImageChunk || object instanceof SemanticPicture) {
+                iterator.remove();
+                continue;
+            }
+            if (object instanceof PDFList) {
+                for (ListItem listItem : ((PDFList) object).getListItems()) {
+                    removeImagesRecursively(listItem.getContents());
+                }
+                continue;
+            }
+            if (object instanceof TableBorder) {
+                for (TableBorderRow row : ((TableBorder) object).getRows()) {
+                    for (TableBorderCell cell : row.getCells()) {
+                        removeImagesRecursively(cell.getContents());
+                    }
+                }
+                continue;
+            }
+            if (object instanceof SemanticHeaderOrFooter) {
+                removeImagesRecursively(((SemanticHeaderOrFooter) object).getContents());
+            }
+        }
     }
 
     /**

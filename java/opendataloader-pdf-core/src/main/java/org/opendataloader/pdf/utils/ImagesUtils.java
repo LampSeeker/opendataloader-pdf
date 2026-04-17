@@ -53,6 +53,7 @@ public class ImagesUtils {
     private ContrastRatioConsumer contrastRatioConsumer;
     private final Set<Integer> failedPages = new LinkedHashSet<>();
     private Integer currentRenderingPageNumber;
+    private boolean currentImageHasContrastWarning;
 
     private final Handler contrastWarningHandler = new Handler() {
         @Override
@@ -63,6 +64,7 @@ public class ImagesUtils {
             String message = record.getMessage();
             if (record.getLevel().intValue() >= Level.WARNING.intValue()
                 && (message.contains(WIDTH_WARNING_FRAGMENT) || message.contains(HEIGHT_WARNING_FRAGMENT))) {
+                currentImageHasContrastWarning = true;
                 markPageAsFailed(currentRenderingPageNumber,
                     "ContrastRatioConsumer warning: " + message);
             }
@@ -177,6 +179,7 @@ public class ImagesUtils {
     private void createImageFile(BoundingBox imageBox, String fileName, String imageFormat, Integer pageNumber) {
         Integer effectivePageNumber = resolvePageNumber(pageNumber, imageBox);
         currentRenderingPageNumber = effectivePageNumber;
+        currentImageHasContrastWarning = false;
         try {
             if (imageBox == null || imageBox.getWidth() <= 0 || imageBox.getHeight() <= 0) {
                 markPageAsFailed(effectivePageNumber,
@@ -186,11 +189,14 @@ public class ImagesUtils {
             }
             File outputFile = new File(fileName);
             BufferedImage targetImage = contrastRatioConsumer != null ? contrastRatioConsumer.getPageSubImage(imageBox) : null;
-            if (targetImage == null) {
-                markPageAsFailed(effectivePageNumber, "Rendered image is null");
+            if (currentImageHasContrastWarning) {
+                LOGGER.log(Level.WARNING,
+                    "Skipping image save on page {0} due to ContrastRatioConsumer width/height warning.",
+                    effectivePageNumber != null ? effectivePageNumber + 1 : -1);
                 return;
             }
-            if (effectivePageNumber != null && failedPages.contains(effectivePageNumber)) {
+            if (targetImage == null) {
+                markPageAsFailed(effectivePageNumber, "Rendered image is null");
                 return;
             }
             ImageIO.write(targetImage, imageFormat, outputFile);
@@ -201,6 +207,7 @@ public class ImagesUtils {
             LOGGER.log(Level.WARNING, "Unable to create image files: " + e.getMessage());
         } finally {
             currentRenderingPageNumber = null;
+            currentImageHasContrastWarning = false;
         }
     }
 
