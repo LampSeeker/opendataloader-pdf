@@ -25,6 +25,7 @@ import org.opendataloader.pdf.html.HtmlGenerator;
 import org.opendataloader.pdf.html.HtmlGeneratorFactory;
 import org.opendataloader.pdf.pdf.PDFWriter;
 import org.opendataloader.pdf.api.Config;
+import org.opendataloader.pdf.hybrid.HybridConfig;
 import org.opendataloader.pdf.text.TextGenerator;
 import org.opendataloader.pdf.utils.ContentSanitizer;
 import org.opendataloader.pdf.utils.ImagesUtils;
@@ -379,8 +380,20 @@ public class DocumentProcessor {
                 imagesDirectory = config.getOutputFolder() + File.separator + baseName + MarkdownSyntax.IMAGES_DIRECTORY_SUFFIX;
             }
             StaticLayoutContainers.setImagesDirectory(imagesDirectory);
-            ImagesUtils imagesUtils = new ImagesUtils();
-            imagesUtils.write(contents, inputPdfName, config.getPassword());
+            Set<Integer> failedImagePages = writeImages(contents, inputPdfName, config);
+            if (!config.isHybridEnabled() && !failedImagePages.isEmpty()) {
+                Set<Integer> reroutedPages = rerouteFailedPagesToHybrid(inputPdfName, contents, config, failedImagePages);
+                if (!reroutedPages.isEmpty()) {
+                    // Re-render all images so indexes and output references stay consistent.
+                    StaticLayoutContainers.resetImageIndex();
+                    Set<Integer> stillFailedPages = writeImages(contents, inputPdfName, config);
+                    if (!stillFailedPages.isEmpty()) {
+                        LOGGER.log(Level.WARNING,
+                            "Image rendering warnings remain after hybrid fallback on pages {0}",
+                            toOneIndexedPageList(stillFailedPages));
+                    }
+                }
+            }
         }
         if (config.isGenerateTaggedPDF()) {
             AutoTaggingProcessor.createTaggedPDF(inputPDF, config.getOutputFolder(),
@@ -409,6 +422,73 @@ public class DocumentProcessor {
                 textGenerator.writeToText(contents);
             }
         }
+    }
+
+    private static Set<Integer> writeImages(List<List<IObject>> contents, String inputPdfName, Config config) {
+        ImagesUtils imagesUtils = new ImagesUtils();
+        imagesUtils.write(contents, inputPdfName, config.getPassword());
+        return new LinkedHashSet<>(imagesUtils.getFailedPages());
+    }
+
+    private static Set<Integer> rerouteFailedPagesToHybrid(
+            String inputPdfName,
+            List<List<IObject>> contents,
+            Config config,
+            Set<Integer> failedPages) {
+        Set<Integer> validFailedPages = failedPages.stream()
+            .filter(Objects::nonNull)
+            .filter(page -> page >= 0 && page < contents.size())
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (validFailedPages.isEmpty()) {
+            return Collections.emptySet();
+        }
+
+        String originalHybrid = config.getHybrid();
+        String originalMode = config.getHybridConfig().getMode();
+        boolean originalFallbackToJava = config.getHybridConfig().isFallbackToJava();
+
+        try {
+            config.setHybrid(Config.HYBRID_DOCLING_FAST);
+            config.getHybridConfig().setMode(HybridConfig.MODE_FULL);
+            config.getHybridConfig().setFallbackToJava(true);
+
+            List<List<IObject>> hybridContents = HybridDocumentProcessor.processDocument(
+                inputPdfName,
+                config,
+                validFailedPages
+            );
+
+            Set<Integer> replacedPages = new LinkedHashSet<>();
+            for (Integer pageNumber : validFailedPages) {
+                if (pageNumber < hybridContents.size() && hybridContents.get(pageNumber) != null) {
+                    contents.set(pageNumber, hybridContents.get(pageNumber));
+                    replacedPages.add(pageNumber);
+                }
+            }
+
+            if (!replacedPages.isEmpty()) {
+                LOGGER.log(Level.WARNING,
+                    "Image rendering warnings detected on pages {0}. Reprocessed with hybrid backend.",
+                    toOneIndexedPageList(replacedPages));
+            }
+            return replacedPages;
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING,
+                "Hybrid fallback failed for pages {0}. Keeping Java output. Reason: {1}",
+                new Object[]{toOneIndexedPageList(validFailedPages), e.getMessage()});
+            return Collections.emptySet();
+        } finally {
+            config.setHybrid(originalHybrid);
+            config.getHybridConfig().setMode(originalMode);
+            config.getHybridConfig().setFallbackToJava(originalFallbackToJava);
+        }
+    }
+
+    private static List<Integer> toOneIndexedPageList(Set<Integer> zeroIndexedPages) {
+        return zeroIndexedPages.stream()
+            .map(page -> page + 1)
+            .sorted()
+            .collect(Collectors.toList());
     }
 
     /**

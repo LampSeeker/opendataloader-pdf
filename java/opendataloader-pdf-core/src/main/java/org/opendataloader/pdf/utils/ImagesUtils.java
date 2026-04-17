@@ -34,16 +34,57 @@ import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.logging.Handler;
 import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 public class ImagesUtils {
     private static final Logger LOGGER = Logger.getLogger(ImagesUtils.class.getCanonicalName());
+    private static final Logger CONTRAST_RATIO_LOGGER =
+        Logger.getLogger("org.verapdf.wcag.algorithms.semanticalgorithms.consumers.ContrastRatioConsumer");
+    private static final String WIDTH_WARNING_FRAGMENT = "width is <= 0";
+    private static final String HEIGHT_WARNING_FRAGMENT = "height is <= 0";
+
     private ContrastRatioConsumer contrastRatioConsumer;
+    private final Set<Integer> failedPages = new LinkedHashSet<>();
+    private Integer currentRenderingPageNumber;
+
+    private final Handler contrastWarningHandler = new Handler() {
+        @Override
+        public void publish(LogRecord record) {
+            if (record == null || record.getMessage() == null || record.getLevel() == null) {
+                return;
+            }
+            String message = record.getMessage();
+            if (record.getLevel().intValue() >= Level.WARNING.intValue()
+                && (message.contains(WIDTH_WARNING_FRAGMENT) || message.contains(HEIGHT_WARNING_FRAGMENT))) {
+                markPageAsFailed(currentRenderingPageNumber,
+                    "ContrastRatioConsumer warning: " + message);
+            }
+        }
+
+        @Override
+        public void flush() {
+            // no-op
+        }
+
+        @Override
+        public void close() {
+            // no-op
+        }
+    };
 
     public ContrastRatioConsumer getContrastRatioConsumer() {
         return contrastRatioConsumer;
+    }
+
+    public Set<Integer> getFailedPages() {
+        return Collections.unmodifiableSet(failedPages);
     }
 
     public void createImagesDirectory(String path) {
@@ -54,22 +95,31 @@ public class ImagesUtils {
     }
 
     public void write(List<List<IObject>> contents, String pdfFilePath, String password) {
-        for (int pageNumber = 0; pageNumber < StaticContainers.getDocument().getNumberOfPages(); pageNumber++) {
-            for (IObject content : contents.get(pageNumber)) {
-                writeFromContents(content, pdfFilePath, password);
+        attachContrastWarningHandler();
+        try {
+            for (int pageNumber = 0; pageNumber < StaticContainers.getDocument().getNumberOfPages(); pageNumber++) {
+                for (IObject content : contents.get(pageNumber)) {
+                    writeFromContents(content, pdfFilePath, password, pageNumber);
+                }
             }
+        } finally {
+            currentRenderingPageNumber = null;
+            detachContrastWarningHandler();
         }
     }
 
-    private void writeFromContents(IObject content, String pdfFilePath, String password) {
+    private void writeFromContents(IObject content, String pdfFilePath, String password, int pageNumber) {
+        if (failedPages.contains(pageNumber)) {
+            return;
+        }
         if (content instanceof ImageChunk) {
-            writeImage((ImageChunk) content, pdfFilePath, password);
+            writeImage((ImageChunk) content, pdfFilePath, password, pageNumber);
         } else if (content instanceof SemanticPicture) {
-            writePicture((SemanticPicture) content, pdfFilePath, password);
+            writePicture((SemanticPicture) content, pdfFilePath, password, pageNumber);
         } else if (content instanceof PDFList) {
             for (ListItem listItem : ((PDFList) content).getListItems()) {
                 for (IObject item : listItem.getContents()) {
-                    writeFromContents(item, pdfFilePath, password);
+                    writeFromContents(item, pdfFilePath, password, pageNumber);
                 }
             }
         } else if (content instanceof TableBorder) {
@@ -79,56 +129,119 @@ public class ImagesUtils {
                     TableBorderCell cell = cells[columnNumber];
                     if (cell.getColNumber() == columnNumber && cell.getRowNumber() == row.getRowNumber()) {
                         for (IObject item : cell.getContents()) {
-                            writeFromContents(item, pdfFilePath, password);
+                            writeFromContents(item, pdfFilePath, password, pageNumber);
                         }
                     }
                 }
             }
         } else if (content instanceof SemanticHeaderOrFooter) {
             for (IObject item : ((SemanticHeaderOrFooter) content).getContents()) {
-                writeFromContents(item, pdfFilePath, password);
+                writeFromContents(item, pdfFilePath, password, pageNumber);
             }
         }
     }
 
     protected void writeImage(ImageChunk chunk, String pdfFilePath, String password) {
+        writeImage(chunk, pdfFilePath, password, chunk != null ? chunk.getPageNumber() : null);
+    }
+
+    private void writeImage(ImageChunk chunk, String pdfFilePath, String password, Integer pageNumber) {
         int currentImageIndex = StaticLayoutContainers.incrementImageIndex();
         if (currentImageIndex == 1) {
             createImagesDirectory(StaticLayoutContainers.getImagesDirectory());
             contrastRatioConsumer = StaticLayoutContainers.getContrastRatioConsumer(pdfFilePath, password, false, null);
         }
         String imageFormat = StaticLayoutContainers.getImageFormat();
-        String fileName = String.format(MarkdownSyntax.IMAGE_FILE_NAME_FORMAT, StaticLayoutContainers.getImagesDirectory(), File.separator, currentImageIndex, imageFormat);
+        String fileName = String.format(MarkdownSyntax.IMAGE_FILE_NAME_FORMAT,
+            StaticLayoutContainers.getImagesDirectory(), File.separator, currentImageIndex, imageFormat);
         chunk.setIndex(currentImageIndex);
-        createImageFile(chunk.getBoundingBox(), fileName, imageFormat);
+        createImageFile(chunk.getBoundingBox(), fileName, imageFormat, pageNumber);
     }
 
     protected void writePicture(SemanticPicture picture, String pdfFilePath, String password) {
+        writePicture(picture, pdfFilePath, password, picture != null ? picture.getPageNumber() : null);
+    }
+
+    private void writePicture(SemanticPicture picture, String pdfFilePath, String password, Integer pageNumber) {
         int pictureIndex = picture.getPictureIndex();
         if (contrastRatioConsumer == null) {
             createImagesDirectory(StaticLayoutContainers.getImagesDirectory());
             contrastRatioConsumer = StaticLayoutContainers.getContrastRatioConsumer(pdfFilePath, password, false, null);
         }
         String imageFormat = StaticLayoutContainers.getImageFormat();
-        String fileName = String.format(MarkdownSyntax.IMAGE_FILE_NAME_FORMAT, StaticLayoutContainers.getImagesDirectory(), File.separator, pictureIndex, imageFormat);
-        createImageFile(picture.getBoundingBox(), fileName, imageFormat);
+        String fileName = String.format(MarkdownSyntax.IMAGE_FILE_NAME_FORMAT,
+            StaticLayoutContainers.getImagesDirectory(), File.separator, pictureIndex, imageFormat);
+        createImageFile(picture.getBoundingBox(), fileName, imageFormat, pageNumber);
     }
 
-    private void createImageFile(BoundingBox imageBox, String fileName, String imageFormat) {
+    private void createImageFile(BoundingBox imageBox, String fileName, String imageFormat, Integer pageNumber) {
+        Integer effectivePageNumber = resolvePageNumber(pageNumber, imageBox);
+        currentRenderingPageNumber = effectivePageNumber;
         try {
+            if (imageBox == null || imageBox.getWidth() <= 0 || imageBox.getHeight() <= 0) {
+                markPageAsFailed(effectivePageNumber,
+                    "Invalid image bounding box ("
+                        + (imageBox == null ? "null" : imageBox.getWidth() + "x" + imageBox.getHeight()) + ")");
+                return;
+            }
             File outputFile = new File(fileName);
             BufferedImage targetImage = contrastRatioConsumer != null ? contrastRatioConsumer.getPageSubImage(imageBox) : null;
             if (targetImage == null) {
+                markPageAsFailed(effectivePageNumber, "Rendered image is null");
+                return;
+            }
+            if (effectivePageNumber != null && failedPages.contains(effectivePageNumber)) {
                 return;
             }
             ImageIO.write(targetImage, imageFormat, outputFile);
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Unable to create image files: " + e.getMessage());
+        } catch (RuntimeException e) {
+            markPageAsFailed(effectivePageNumber, "Runtime error while rendering image: " + e.getMessage());
+            LOGGER.log(Level.WARNING, "Unable to create image files: " + e.getMessage());
+        } finally {
+            currentRenderingPageNumber = null;
         }
     }
 
     public static boolean isImageFileExists(String fileName) {
         File outputFile = new File(fileName);
         return outputFile.exists();
+    }
+
+    private void attachContrastWarningHandler() {
+        CONTRAST_RATIO_LOGGER.addHandler(contrastWarningHandler);
+    }
+
+    private void detachContrastWarningHandler() {
+        CONTRAST_RATIO_LOGGER.removeHandler(contrastWarningHandler);
+    }
+
+    private Integer resolvePageNumber(Integer pageNumber, BoundingBox imageBox) {
+        if (pageNumber != null && pageNumber >= 0) {
+            return pageNumber;
+        }
+        if (imageBox != null) {
+            try {
+                int imagePageNumber = imageBox.getPageNumber();
+                if (imagePageNumber >= 0) {
+                    return imagePageNumber;
+                }
+            } catch (RuntimeException ignored) {
+                // Keep fallback behavior when page number is unavailable
+            }
+        }
+        return null;
+    }
+
+    private void markPageAsFailed(Integer pageNumber, String reason) {
+        if (pageNumber == null || pageNumber < 0) {
+            return;
+        }
+        if (failedPages.add(pageNumber)) {
+            LOGGER.log(Level.WARNING,
+                "Image rendering issue on page {0}: {1}",
+                new Object[]{pageNumber + 1, reason});
+        }
     }
 }
